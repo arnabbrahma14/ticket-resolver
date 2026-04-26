@@ -1,0 +1,739 @@
+[
+  {
+    "id": "INC-001",
+    "title": "PostgreSQL connection pool exhausted",
+    "symptoms": "Connection timeouts on /api/login, HTTP 500 errors, DB max_connections reached",
+    "service": "auth-service",
+    "root_cause": "Missing connection.close() in retry loop introduced in v2.3.1 deployment",
+    "investigation_steps": [
+      "Checked error logs — saw too many connections errors starting at 02:03",
+      "Checked DB metrics — active connections at 100/100 max_connections limit",
+      "Reviewed recent deployments — auth-service v2.3.1 deployed at 01:47",
+      "Diffed v2.3.1 vs v2.3.0 — found missing connection.close() in error handler"
+    ],
+    "resolution_steps": [
+      "Run: SELECT count(*), state FROM pg_stat_activity GROUP BY state to confirm connections maxed",
+      "Run: git diff v2.3.0..v2.3.1 to find the connection leak",
+      "Rollback: kubectl rollout undo deployment/auth-service",
+      "Monitor: watch connection count drop below 20 within 5 minutes"
+    ],
+    "resolution_type": "rollback",
+    "tags": ["postgresql", "connection-pool", "auth-service", "deployment-regression"],
+    "severity": "critical",
+    "time_to_resolve_minutes": 23
+  },
+  {
+    "id": "INC-002",
+    "title": "Payment service high latency — Redis cache miss storm",
+    "symptoms": "Payment processing taking 8-12 seconds instead of normal 200ms, checkout timeouts",
+    "service": "payment-service",
+    "root_cause": "Redis cache flushed during scheduled maintenance, all requests hitting DB directly",
+    "investigation_steps": [
+      "Checked payment-service logs — slow DB queries on every request",
+      "Checked Redis metrics — cache hit rate dropped from 94% to 2%",
+      "Found scheduled maintenance task flushed Redis at 03:00",
+      "DB query time was normal but volume was 50x higher than usual"
+    ],
+    "resolution_steps": [
+      "Check Redis cache hit rate: redis-cli INFO stats | grep keyspace_hits",
+      "Confirm maintenance job ran: check cron logs at /var/log/maintenance.log",
+      "Manually warm cache by running: python scripts/warm_cache.py",
+      "Monitor hit rate recovery — should return to 90%+ within 15 minutes"
+    ],
+    "resolution_type": "cache_warm",
+    "tags": ["redis", "cache", "payment-service", "latency", "maintenance"],
+    "severity": "high",
+    "time_to_resolve_minutes": 15
+  },
+  {
+    "id": "INC-003",
+    "title": "Notification service memory leak — OOM crash loop",
+    "symptoms": "notification-service pod restarting every 20 mins, OOMKilled in events",
+    "service": "notification-service",
+    "root_cause": "Email template renderer accumulating parsed templates in memory without eviction",
+    "investigation_steps": [
+      "Checked service logs — OOMKilled events every 18-22 minutes",
+      "Checked memory metrics — steady linear increase before each crash",
+      "Heap dump showed 85% memory held by template cache objects",
+      "Traced to template_renderer.py — cache had no max size or TTL set"
+    ],
+    "resolution_steps": [
+      "Confirm memory pattern: kubectl top pod -l app=notification-service --containers",
+      "Check template cache size in logs: grep 'template_cache size' /var/log/notification.log",
+      "Immediate relief: kubectl rollout restart deployment/notification-service",
+      "Permanent fix: add LRU cache with max_size=100 and TTL=3600 in template_renderer.py",
+      "Deploy fix and verify memory stays flat over 30 minutes"
+    ],
+    "resolution_type": "code_fix",
+    "tags": ["memory-leak", "notification-service", "oom", "template-cache"],
+    "severity": "high",
+    "time_to_resolve_minutes": 47
+  },
+  {
+    "id": "INC-004",
+    "title": "API gateway 503 — upstream timeout to inventory service",
+    "symptoms": "All product listing pages showing errors, 503 from API gateway logs",
+    "service": "api-gateway",
+    "root_cause": "Inventory service DB migration locked tables for 8 minutes during peak traffic",
+    "investigation_steps": [
+      "API gateway logs showed upstream timeout to inventory-service",
+      "inventory-service logs showed DB lock wait timeouts",
+      "DB admin logs confirmed ALTER TABLE migration running on products table",
+      "Migration had no timeout set and ran during business hours"
+    ],
+    "resolution_steps": [
+      "Confirm table lock: SELECT * FROM pg_locks WHERE NOT granted",
+      "Identify blocking query: SELECT pid, query, state FROM pg_stat_activity WHERE wait_event_type = 'Lock'",
+      "Kill the migration: SELECT pg_terminate_backend(pid) for the migration process",
+      "Verify 503s stop within 60 seconds of killing the lock",
+      "Reschedule migration for 2am maintenance window with statement_timeout set"
+    ],
+    "resolution_type": "kill_and_reschedule",
+    "tags": ["api-gateway", "503", "db-migration", "table-lock", "inventory"],
+    "severity": "critical",
+    "time_to_resolve_minutes": 11
+  },
+  {
+    "id": "INC-005",
+    "title": "Search service returning stale results — Elasticsearch index not updating",
+    "symptoms": "Product search showing out-of-stock items as available, new products not appearing",
+    "service": "search-service",
+    "root_cause": "Elasticsearch sync worker OOM crashed silently, queue backed up with 180k events",
+    "investigation_steps": [
+      "Search returning results from 6 hours ago based on index timestamps",
+      "Elasticsearch sync worker pod in CrashLoopBackOff",
+      "Worker OOM due to processing batch of 50000 products at once",
+      "Queue had 180000 pending update events backed up"
+    ],
+    "resolution_steps": [
+      "Check sync worker status: kubectl get pods -l app=es-sync-worker",
+      "Check queue depth: rabbitmq-admin queue-depth product-updates",
+      "Check worker logs for OOM: kubectl logs es-sync-worker --previous | tail -50",
+      "Restart worker with smaller batch: set BATCH_SIZE=1000 in worker config",
+      "Monitor queue drain — should process 180k events in about 40 minutes",
+      "Verify search index freshness after drain completes"
+    ],
+    "resolution_type": "restart_with_config",
+    "tags": ["elasticsearch", "search", "sync-worker", "oom", "stale-data"],
+    "severity": "high",
+    "time_to_resolve_minutes": 52
+  },
+  {
+    "id": "INC-006",
+    "title": "Order service deadlock — concurrent checkout requests",
+    "symptoms": "Random checkout failures, deadlock errors in order-service logs, orders stuck in pending",
+    "service": "order-service",
+    "root_cause": "Two concurrent checkouts acquiring row locks in opposite order causing deadlock",
+    "investigation_steps": [
+      "order-service logs showed deadlock detected errors with transaction IDs",
+      "DB logs confirmed deadlock between transactions on orders and inventory tables",
+      "Code review showed checkout acquiring order lock then inventory lock",
+      "Refund flow acquiring inventory lock then order lock — opposite order"
+    ],
+    "resolution_steps": [
+      "Confirm active deadlocks: SELECT * FROM pg_stat_activity WHERE wait_event = 'relation'",
+      "Kill stuck transactions: SELECT pg_terminate_backend(pid) for deadlocked pids",
+      "Immediate relief clears pending orders — verify in orders table",
+      "Permanent fix: ensure all transactions acquire locks in same order (orders then inventory)",
+      "Add deadlock retry logic with exponential backoff in checkout service"
+    ],
+    "resolution_type": "code_fix",
+    "tags": ["deadlock", "order-service", "postgresql", "concurrency", "checkout"],
+    "severity": "high",
+    "time_to_resolve_minutes": 38
+  },
+  {
+    "id": "INC-007",
+    "title": "SSL certificate expired — user-service HTTPS failing",
+    "symptoms": "Users seeing SSL certificate error, all HTTPS requests to user-service rejected",
+    "service": "user-service",
+    "root_cause": "SSL certificate expired — auto-renewal cron job had been failing silently for 2 weeks",
+    "investigation_steps": [
+      "Browser SSL error confirmed certificate expiry date was yesterday",
+      "Checked cert-manager logs — renewal job failing with DNS validation error",
+      "DNS TXT record for ACME challenge was deleted 2 weeks ago during DNS cleanup",
+      "Renewal had been silently failing, no alerting was configured"
+    ],
+    "resolution_steps": [
+      "Confirm expiry: openssl s_client -connect user-service.domain.com:443 | openssl x509 -noout -dates",
+      "Check cert-manager: kubectl logs -n cert-manager deployment/cert-manager | grep user-service",
+      "Re-add DNS TXT record for ACME challenge as shown in cert-manager logs",
+      "Trigger immediate renewal: kubectl annotate certificate user-service-tls cert-manager.io/issue-temporary-certificate=true",
+      "Verify new cert issued within 5 minutes and HTTPS restored",
+      "Add alerting for cert expiry 30 days in advance"
+    ],
+    "resolution_type": "cert_renewal",
+    "tags": ["ssl", "certificate", "user-service", "https", "cert-manager"],
+    "severity": "critical",
+    "time_to_resolve_minutes": 18
+  },
+  {
+    "id": "INC-008",
+    "title": "Analytics pipeline failing — disk full on data processing node",
+    "symptoms": "Analytics reports not updating, pipeline jobs failing with write errors",
+    "service": "analytics-service",
+    "root_cause": "Temp files from failed pipeline runs accumulated over 6 weeks, filled 500GB disk",
+    "investigation_steps": [
+      "Pipeline logs showed No space left on device errors",
+      "df -h confirmed /data partition at 100% — 500GB full",
+      "du -sh /data/tmp showed 380GB of orphaned temp files from failed runs",
+      "Failed runs were not cleaning up temp files due to missing finally block"
+    ],
+    "resolution_steps": [
+      "Confirm disk usage: df -h /data and du -sh /data/tmp",
+      "Safe to delete temp files older than 24h: find /data/tmp -mtime +1 -delete",
+      "Verify disk drops below 80% after cleanup",
+      "Restart pipeline: systemctl restart analytics-pipeline",
+      "Add cleanup to pipeline code: use try/finally to always delete temp files",
+      "Add disk usage alerting at 75% threshold"
+    ],
+    "resolution_type": "cleanup_and_fix",
+    "tags": ["disk-full", "analytics-service", "temp-files", "pipeline"],
+    "severity": "medium",
+    "time_to_resolve_minutes": 25
+  },
+  {
+    "id": "INC-009",
+    "title": "Third-party payment gateway timeout — Stripe API unreachable",
+    "symptoms": "All payments failing, Stripe API calls timing out after 30 seconds",
+    "service": "payment-service",
+    "root_cause": "Stripe had a regional outage affecting their EU endpoints for 45 minutes",
+    "investigation_steps": [
+      "payment-service logs showed Stripe API connection timeout on every request",
+      "Checked Stripe status page — confirmed EU region incident in progress",
+      "Internal infrastructure metrics all normal — not our issue",
+      "Fallback to US endpoint was disabled in config after previous cost optimisation"
+    ],
+    "resolution_steps": [
+      "Confirm Stripe outage: check https://status.stripe.com for active incidents",
+      "Check which endpoint is configured: grep STRIPE_API_URL in payment-service config",
+      "Enable US endpoint fallback: set STRIPE_FALLBACK_ENDPOINT=https://api.stripe.com in config",
+      "Restart payment-service to pick up new config",
+      "Monitor payment success rate — should recover immediately",
+      "Re-enable EU endpoint once Stripe resolves the incident"
+    ],
+    "resolution_type": "config_change",
+    "tags": ["stripe", "payment-service", "third-party", "timeout", "outage"],
+    "severity": "critical",
+    "time_to_resolve_minutes": 12
+  },
+  {
+    "id": "INC-010",
+    "title": "User service CPU spike — N+1 query on profile endpoint",
+    "symptoms": "user-service CPU at 100%, /api/profile endpoint taking 15-30 seconds, timeouts",
+    "service": "user-service",
+    "root_cause": "New feature deployment introduced N+1 query — fetching user orders one by one in a loop",
+    "investigation_steps": [
+      "CPU metrics showed spike starting exactly at v3.1.0 deployment time",
+      "Slow query log showed hundreds of SELECT queries per profile request",
+      "Each query fetching one order record — profile with 50 orders made 50 DB queries",
+      "Previous version made a single JOIN query — regression introduced in new feature"
+    ],
+    "resolution_steps": [
+      "Confirm N+1: enable query logging and hit /api/profile, count queries in logs",
+      "Check deployment time vs CPU spike: compare deployment timestamp with metrics",
+      "Quick fix: rollback to v3.0.9 to restore single JOIN query",
+      "Proper fix: rewrite profile endpoint to use SELECT * FROM orders WHERE user_id IN (...)",
+      "Add query count assertion in integration tests to prevent regression"
+    ],
+    "resolution_type": "rollback_then_fix",
+    "tags": ["n+1-query", "user-service", "cpu-spike", "performance", "deployment-regression"],
+    "severity": "high",
+    "time_to_resolve_minutes": 29
+  },
+  {
+    "id": "INC-011",
+    "title": "Message queue consumer lag — email jobs not processing",
+    "symptoms": "Transactional emails delayed by 2-4 hours, queue depth growing continuously",
+    "service": "email-service",
+    "root_cause": "Single consumer instance unable to keep up after 10x traffic spike from marketing campaign",
+    "investigation_steps": [
+      "Queue monitoring showed consumer lag at 45000 messages and growing",
+      "email-service had only 1 consumer instance running",
+      "Marketing sent campaign email to 500k users triggering mass signups",
+      "Consumer processing at 50 msgs/sec, incoming at 500 msgs/sec"
+    ],
+    "resolution_steps": [
+      "Check queue depth: rabbitmq-admin list-queues name messages consumers",
+      "Check current consumer count and processing rate in email-service logs",
+      "Scale up consumers: kubectl scale deployment email-consumer --replicas=10",
+      "Monitor queue depth — should start decreasing within 2 minutes",
+      "Set up auto-scaling based on queue depth metric going forward"
+    ],
+    "resolution_type": "scale_up",
+    "tags": ["message-queue", "email-service", "consumer-lag", "scaling", "rabbitmq"],
+    "severity": "medium",
+    "time_to_resolve_minutes": 20
+  },
+  {
+    "id": "INC-012",
+    "title": "Auth service JWT secret rotation broke all sessions",
+    "symptoms": "All logged-in users suddenly getting 401 errors, mass session expiry across platform",
+    "service": "auth-service",
+    "root_cause": "JWT secret rotated in auth-service but other services still using old secret to verify tokens",
+    "investigation_steps": [
+      "401 errors spiked across all services simultaneously",
+      "auth-service logs showed successful token generation with new secret",
+      "api-gateway logs showed JWT signature verification failed on every request",
+      "Found secret rotation script only updated auth-service env, not dependent services"
+    ],
+    "resolution_steps": [
+      "Confirm JWT verification error: kubectl logs api-gateway | grep 'signature verification'",
+      "Check which secret each service is using: kubectl get secret jwt-secret -o yaml for each service",
+      "Update JWT secret in all dependent services: api-gateway, order-service, user-service",
+      "Rolling restart all services to pick up new secret",
+      "Verify 401s stop within 2 minutes of restarts completing",
+      "Update rotation runbook to include all dependent services"
+    ],
+    "resolution_type": "config_propagation",
+    "tags": ["jwt", "auth-service", "secret-rotation", "401", "sessions"],
+    "severity": "critical",
+    "time_to_resolve_minutes": 16
+  },
+  {
+    "id": "INC-013",
+    "title": "Inventory service slow — missing DB index on product lookup",
+    "symptoms": "Product detail pages loading in 8-12 seconds, inventory-service response time degraded",
+    "service": "inventory-service",
+    "root_cause": "Full table scan on products table after new filtering feature deployed without adding index",
+    "investigation_steps": [
+      "inventory-service p99 latency went from 120ms to 9000ms after v2.1.0 deploy",
+      "Slow query log showed sequential scan on products table taking 7-8 seconds",
+      "EXPLAIN ANALYZE confirmed full table scan on category_id column",
+      "New feature added WHERE category_id = ? filter but no index was created"
+    ],
+    "resolution_steps": [
+      "Confirm slow query: run EXPLAIN ANALYZE SELECT * FROM products WHERE category_id = 1",
+      "Check existing indexes: SELECT indexname FROM pg_indexes WHERE tablename = 'products'",
+      "Add index concurrently to avoid locking: CREATE INDEX CONCURRENTLY idx_products_category ON products(category_id)",
+      "Verify query plan switches to index scan after creation",
+      "Monitor p99 latency — should return to under 150ms within minutes of index creation"
+    ],
+    "resolution_type": "add_index",
+    "tags": ["slow-query", "inventory-service", "missing-index", "postgresql", "performance"],
+    "severity": "high",
+    "time_to_resolve_minutes": 14
+  },
+  {
+    "id": "INC-014",
+    "title": "Shipping service crash — unhandled null in address parser",
+    "symptoms": "Shipping label generation failing for all international orders, 500 errors",
+    "service": "shipping-service",
+    "root_cause": "New address parser assuming state field always present — international addresses have no state",
+    "investigation_steps": [
+      "shipping-service logs showed NullPointerException on address.state.toUpperCase()",
+      "Only international orders affected — domestic orders working fine",
+      "v1.5.0 deployed 3 hours ago added new address validation",
+      "New validation code assumed state field was always populated"
+    ],
+    "resolution_steps": [
+      "Confirm error in logs: kubectl logs shipping-service | grep NullPointerException | tail -20",
+      "Verify only international orders affected by checking order IDs in errors vs country codes",
+      "Immediate fix: rollback to v1.4.9 to restore international shipping",
+      "Proper fix: add null check — use address.state?.toUpperCase() or default to empty string",
+      "Add integration test with international address (no state field) before next deploy"
+    ],
+    "resolution_type": "rollback_then_fix",
+    "tags": ["null-pointer", "shipping-service", "international", "address-parser", "deployment-regression"],
+    "severity": "high",
+    "time_to_resolve_minutes": 22
+  },
+  {
+    "id": "INC-015",
+    "title": "Rate limiter blocking legitimate users — Redis counter overflow",
+    "symptoms": "High-value customers getting 429 Too Many Requests despite normal usage",
+    "service": "api-gateway",
+    "root_cause": "Redis rate limit counter stored as 32-bit integer overflowed for accounts with high historical request counts",
+    "investigation_steps": [
+      "429 errors only affecting accounts created before 2022 with high usage",
+      "Rate limit counters in Redis showing negative values for affected accounts",
+      "Counter stored as Redis INCR which defaults to 64-bit but was cast to int32 in application code",
+      "Accounts with over 2.1 billion lifetime requests hit integer overflow"
+    ],
+    "resolution_steps": [
+      "Identify affected accounts: redis-cli SCAN with pattern ratelimit:* and find negative values",
+      "Immediate fix: redis-cli DEL ratelimit:user:{id} to reset counters for affected users",
+      "Verify affected users can make requests again within 60 seconds",
+      "Fix application code to use int64 for counter storage",
+      "Add monitoring for negative counter values as anomaly detection"
+    ],
+    "resolution_type": "data_fix_and_code_fix",
+    "tags": ["rate-limiting", "api-gateway", "redis", "integer-overflow", "429"],
+    "severity": "high",
+    "time_to_resolve_minutes": 31
+  },
+  {
+    "id": "INC-016",
+    "title": "Reporting service timeout — unoptimised aggregation query",
+    "symptoms": "Monthly sales report generation timing out after 30 seconds, finance team unable to pull reports",
+    "service": "reporting-service",
+    "root_cause": "Report query doing aggregation over 18 months of un-indexed transaction data — 40M rows",
+    "investigation_steps": [
+      "Report endpoint timing out at exactly 30 seconds — hitting query timeout",
+      "EXPLAIN ANALYZE showed sequential scan on transactions table — 40 million rows",
+      "No index on transaction_date column used in WHERE clause",
+      "Data volume has grown 3x in past 6 months making previously acceptable query too slow"
+    ],
+    "resolution_steps": [
+      "Confirm query timeout: check reporting-service logs for timeout errors with query details",
+      "Run EXPLAIN ANALYZE on the report query to see full scan cost",
+      "Add index: CREATE INDEX CONCURRENTLY idx_transactions_date ON transactions(transaction_date)",
+      "If index not sufficient, add monthly pre-aggregation table updated nightly",
+      "Increase query timeout temporarily to 120s while permanent fix is implemented"
+    ],
+    "resolution_type": "add_index_and_optimise",
+    "tags": ["slow-query", "reporting-service", "aggregation", "timeout", "missing-index"],
+    "severity": "medium",
+    "time_to_resolve_minutes": 45
+  },
+  {
+    "id": "INC-017",
+    "title": "File upload service failing — S3 bucket permissions misconfigured",
+    "symptoms": "Profile picture and document uploads failing with 403 errors, users cannot upload",
+    "service": "upload-service",
+    "root_cause": "IAM policy update removed PutObject permission from upload-service role",
+    "investigation_steps": [
+      "upload-service logs showed AccessDenied: s3:PutObject on every upload attempt",
+      "S3 bucket policy had not changed — issue was in IAM role policy",
+      "Infrastructure team ran IAM policy cleanup script 2 hours before incident",
+      "Script incorrectly removed PutObject from upload-service-role permissions"
+    ],
+    "resolution_steps": [
+      "Confirm IAM error: aws s3 cp test.txt s3://your-bucket/ using upload-service credentials",
+      "Check current IAM policy: aws iam get-role-policy --role-name upload-service-role",
+      "Add back PutObject permission to upload-service-role for the uploads bucket",
+      "Test upload immediately after policy update — takes effect within 60 seconds",
+      "Add IAM policy changes to change management process requiring approval"
+    ],
+    "resolution_type": "iam_fix",
+    "tags": ["s3", "upload-service", "iam", "permissions", "403"],
+    "severity": "high",
+    "time_to_resolve_minutes": 13
+  },
+  {
+    "id": "INC-018",
+    "title": "Recommendation engine cold start — model not loaded in memory",
+    "symptoms": "Product recommendations returning empty, first request after deploy taking 45 seconds",
+    "service": "recommendation-service",
+    "root_cause": "ML model loaded lazily on first request instead of at startup — cold start under load causes timeout",
+    "investigation_steps": [
+      "First request after each deployment timing out for all users hitting that pod",
+      "recommendation-service logs showed model loading taking 42 seconds on first request",
+      "Model is 2.1GB and loaded from GCS on first predict() call",
+      "No readiness probe configured — traffic sent to pod before model loaded"
+    ],
+    "resolution_steps": [
+      "Confirm cold start: kubectl logs recommendation-service | grep 'Loading model'",
+      "Check readiness probe config: kubectl describe deployment recommendation-service",
+      "Immediate fix: kubectl rollout restart to trigger fresh load, then add readiness probe",
+      "Add startup model loading: move model.load() to service __init__ not first request",
+      "Configure readiness probe: httpGet /health only returns 200 after model is loaded",
+      "Consider model caching on persistent volume to speed up future restarts"
+    ],
+    "resolution_type": "config_and_code_fix",
+    "tags": ["ml-model", "recommendation-service", "cold-start", "readiness-probe", "latency"],
+    "severity": "medium",
+    "time_to_resolve_minutes": 35
+  },
+  {
+    "id": "INC-019",
+    "title": "Webhook delivery failures — TLS handshake error to partner endpoint",
+    "symptoms": "Partner integration not receiving order events, webhook delivery failing since morning",
+    "service": "webhook-service",
+    "root_cause": "Partner updated their server to require TLS 1.3 but our webhook client only supports TLS 1.2",
+    "investigation_steps": [
+      "webhook-service logs showed SSL handshake failure on delivery to partner endpoint",
+      "curl to partner endpoint confirmed TLS 1.3 required, 1.2 rejected",
+      "Partner sent email notification about TLS upgrade 2 weeks ago — not actioned",
+      "Webhook client library version was 2 years old with no TLS 1.3 support"
+    ],
+    "resolution_steps": [
+      "Confirm TLS issue: curl --tlsv1.2 https://partner-endpoint.com/webhook and check error",
+      "Check webhook client library version in requirements.txt",
+      "Update webhook client library to latest version with TLS 1.3 support",
+      "Deploy updated service and test webhook delivery to partner endpoint",
+      "Verify delivery success rate returns to 100% in webhook delivery logs",
+      "Set up process to review partner infrastructure change notifications"
+    ],
+    "resolution_type": "library_upgrade",
+    "tags": ["webhook", "tls", "partner-integration", "ssl-handshake", "library"],
+    "severity": "medium",
+    "time_to_resolve_minutes": 28
+  },
+  {
+    "id": "INC-020",
+    "title": "Session store unavailable — Memcached cluster failover failure",
+    "symptoms": "Users being logged out randomly, session data lost intermittently",
+    "service": "session-service",
+    "root_cause": "Primary Memcached node failed but failover to replica failed due to misconfigured health check",
+    "investigation_steps": [
+      "session-service logs showed connection refused to primary Memcached node",
+      "Memcached primary node had crashed due to OOM",
+      "Replica node was healthy but health check endpoint returned wrong status code",
+      "Failover logic checked for HTTP 200 but replica returned HTTP 204"
+    ],
+    "resolution_steps": [
+      "Check Memcached cluster status: memcached-tool primary:11211 stats",
+      "Manually trigger failover: update SESSION_STORE_HOST to point to replica",
+      "Restart session-service to connect to replica — sessions restore immediately",
+      "Fix health check: update failover logic to accept both 200 and 204 as healthy",
+      "Restart crashed primary node and restore as replica once stable",
+      "Add Memcached OOM alerting and increase memory allocation"
+    ],
+    "resolution_type": "failover_and_fix",
+    "tags": ["memcached", "session-service", "failover", "oom", "health-check"],
+    "severity": "critical",
+    "time_to_resolve_minutes": 19
+  },
+  {
+    "id": "INC-021",
+    "title": "CI/CD pipeline deploying broken build — test suite not running",
+    "symptoms": "Production outage after deployment, unit tests would have caught the bug",
+    "service": "deployment-pipeline",
+    "root_cause": "GitHub Actions workflow misconfiguration caused test job to be skipped on main branch merges",
+    "investigation_steps": [
+      "Post-incident review showed regression that unit tests cover was deployed to production",
+      "Checked GitHub Actions run history — test job showed as skipped not passing",
+      "Workflow yaml had incorrect branch filter — tests only ran on PR branches not main",
+      "Change merged directly to main without PR bypassed test requirement"
+    ],
+    "resolution_steps": [
+      "Check workflow runs: review GitHub Actions history for recent main branch deployments",
+      "Identify skipped test jobs and which PRs bypassed the test requirement",
+      "Fix workflow: remove branch filter so tests run on all branches including main",
+      "Add branch protection rule requiring tests to pass before any merge to main",
+      "Rollback the broken deployment: kubectl rollout undo for affected service",
+      "Add required status checks in GitHub branch protection settings"
+    ],
+    "resolution_type": "pipeline_fix_and_rollback",
+    "tags": ["ci-cd", "github-actions", "testing", "deployment-pipeline", "branch-protection"],
+    "severity": "critical",
+    "time_to_resolve_minutes": 41
+  },
+  {
+    "id": "INC-022",
+    "title": "Product images not loading — CDN cache poisoning",
+    "symptoms": "Randomly serving wrong product images to users, some product pages showing competitor images",
+    "service": "cdn",
+    "root_cause": "CDN cache key did not include tenant ID — multi-tenant images cached and served across tenants",
+    "investigation_steps": [
+      "Users reporting seeing wrong product images — images from different seller accounts",
+      "CDN logs showed cache hits serving image responses with wrong tenant IDs",
+      "Cache key was constructed using only image filename, not tenant_id/filename",
+      "Two tenants had products with same filename — cache collision serving wrong image"
+    ],
+    "resolution_steps": [
+      "Immediate: purge entire CDN image cache to stop wrong images being served",
+      "Confirm fix by requesting same filename for two different tenants — should get different images",
+      "Fix cache key: update CDN configuration to use tenant_id/image_filename as cache key",
+      "Purge cache again after config update to ensure clean state",
+      "Audit whether any user data was exposed and notify affected tenants",
+      "Add cache key validation to CDN deployment checklist"
+    ],
+    "resolution_type": "cache_fix",
+    "tags": ["cdn", "cache-poisoning", "multi-tenant", "images", "security"],
+    "severity": "critical",
+    "time_to_resolve_minutes": 24
+  },
+  {
+    "id": "INC-023",
+    "title": "Database replica lag — read queries returning stale data",
+    "symptoms": "Users seeing orders they just placed as missing, inventory counts inconsistent",
+    "service": "order-service",
+    "root_cause": "Read replica fell behind primary by 4 minutes due to long-running analytics query blocking replication",
+    "investigation_steps": [
+      "order-service read queries routed to replica — replica was 4 minutes behind primary",
+      "Replica lag metric showed sudden spike from normal 50ms to 240 seconds",
+      "Analytics team ran large report query directly on replica — blocked replication thread",
+      "Replication slot held open while analytics query ran for 6 minutes"
+    ],
+    "resolution_steps": [
+      "Check replica lag: SELECT now() - pg_last_xact_replay_timestamp() AS replication_lag",
+      "Identify blocking queries: SELECT pid, query, state FROM pg_stat_activity ON replica",
+      "Kill analytics query blocking replication: SELECT pg_terminate_backend(pid)",
+      "Monitor replica lag — should catch up to primary within 2-3 minutes after query killed",
+      "Route order-service reads to primary temporarily until replica is fully caught up",
+      "Move analytics queries to dedicated read replica, not application replica"
+    ],
+    "resolution_type": "kill_query_and_rebalance",
+    "tags": ["replication-lag", "order-service", "postgresql", "read-replica", "analytics"],
+    "severity": "high",
+    "time_to_resolve_minutes": 17
+  },
+  {
+    "id": "INC-024",
+    "title": "API keys exposed in logs — security incident",
+    "symptoms": "Security team detected API keys in application logs indexed by log aggregator",
+    "service": "integration-service",
+    "root_cause": "Debug logging added in v2.0.1 logged full request headers including Authorization header",
+    "investigation_steps": [
+      "Security scan flagged API key pattern in Elasticsearch log index",
+      "Logs showed Authorization: Bearer sk-live-... values in plain text",
+      "Traced to integration-service v2.0.1 — added verbose header logging for debugging",
+      "Debug logging was committed to main branch and deployed without security review"
+    ],
+    "resolution_steps": [
+      "Immediate: rotate all exposed API keys found in logs — treat as compromised",
+      "Disable verbose header logging: deploy integration-service v2.0.2 with debug logs removed",
+      "Purge affected log entries from Elasticsearch: delete documents containing key patterns",
+      "Audit log access to determine who could have seen the exposed keys",
+      "Add secret scanning to CI pipeline to catch credentials in logs before deploy",
+      "Require security review for any changes that touch logging or authentication code"
+    ],
+    "resolution_type": "security_incident",
+    "tags": ["security", "api-key-exposure", "logging", "integration-service", "credentials"],
+    "severity": "critical",
+    "time_to_resolve_minutes": 55
+  },
+  {
+    "id": "INC-025",
+    "title": "Background job runner out of workers — job queue frozen",
+    "symptoms": "Scheduled reports not running, data sync jobs delayed by hours, job queue not draining",
+    "service": "job-runner",
+    "root_cause": "Worker processes leaked due to uncaught exception in job teardown, exhausting worker pool",
+    "investigation_steps": [
+      "job-runner showed 0 available workers despite pool configured for 20",
+      "ps aux showed 20 zombie job-runner processes all stuck in cleanup phase",
+      "Logs showed uncaught exception in job_teardown() leaving processes hanging",
+      "Worker pool had no timeout or health check to reclaim stuck workers"
+    ],
+    "resolution_steps": [
+      "Check worker status: ps aux | grep job-runner to see zombie processes",
+      "Immediate relief: kill all job-runner processes and restart service to reclaim workers",
+      "Verify queue starts draining within 2 minutes of restart",
+      "Fix job_teardown(): wrap in try/except/finally to ensure worker always returns to pool",
+      "Add worker heartbeat timeout — reclaim any worker not reporting in for 60 seconds",
+      "Add worker availability monitoring with alert when available workers drops below 5"
+    ],
+    "resolution_type": "restart_and_fix",
+    "tags": ["job-runner", "worker-pool", "zombie-process", "memory-leak", "background-jobs"],
+    "severity": "medium",
+    "time_to_resolve_minutes": 33
+  },
+  {
+    "id": "INC-026",
+    "title": "Checkout flow broken — feature flag service unavailable",
+    "symptoms": "Checkout page not loading, errors in frontend logs about feature flag service timeout",
+    "service": "feature-flag-service",
+    "root_cause": "Feature flag service had no circuit breaker — when it went down it caused cascade failure in checkout",
+    "investigation_steps": [
+      "Checkout errors started exactly when feature-flag-service pod crashed",
+      "Checkout code called feature flag service synchronously with no timeout",
+      "feature-flag-service crashed due to Redis connection failure — its own dependency",
+      "No circuit breaker or fallback defaults — whole checkout blocked on flag service response"
+    ],
+    "resolution_steps": [
+      "Immediate: restart feature-flag-service to restore checkout functionality",
+      "Verify checkout works within 60 seconds of feature-flag-service coming back up",
+      "Fix Redis connection handling in feature-flag-service to handle Redis being down",
+      "Add circuit breaker to checkout: if flag service unavailable, use hardcoded safe defaults",
+      "Add timeout of 500ms on all feature flag calls — never block user flow on flag service",
+      "Add feature-flag-service health to checkout dependency health check"
+    ],
+    "resolution_type": "restart_and_add_resilience",
+    "tags": ["feature-flags", "checkout", "cascade-failure", "circuit-breaker", "resilience"],
+    "severity": "critical",
+    "time_to_resolve_minutes": 21
+  },
+  {
+    "id": "INC-027",
+    "title": "Data pipeline duplicate records — idempotency key not enforced",
+    "symptoms": "Duplicate transactions appearing in reports, customer accounts showing double charges",
+    "service": "data-pipeline",
+    "root_cause": "Pipeline retry logic reprocessed events without checking idempotency keys after partial failure",
+    "investigation_steps": [
+      "Finance team noticed transaction counts 2x higher than expected in daily report",
+      "data-pipeline logs showed batch reprocessed after a timeout — no idempotency check",
+      "Events table had no unique constraint on idempotency_key column",
+      "Retry ran full batch from checkpoint without checking what was already committed"
+    ],
+    "resolution_steps": [
+      "Identify duplicates: SELECT idempotency_key, COUNT(*) FROM transactions GROUP BY idempotency_key HAVING COUNT(*) > 1",
+      "Deduplicate: DELETE FROM transactions WHERE id NOT IN (SELECT MIN(id) FROM transactions GROUP BY idempotency_key)",
+      "Add unique constraint: ALTER TABLE transactions ADD CONSTRAINT unique_idempotency_key UNIQUE (idempotency_key)",
+      "Fix pipeline retry: check idempotency_key before inserting each record",
+      "Notify affected customers of duplicate charge and initiate refunds",
+      "Add duplicate detection monitoring — alert if same key appears more than once"
+    ],
+    "resolution_type": "data_fix_and_code_fix",
+    "tags": ["data-pipeline", "duplicates", "idempotency", "transactions", "data-quality"],
+    "severity": "critical",
+    "time_to_resolve_minutes": 67
+  },
+  {
+    "id": "INC-028",
+    "title": "Service mesh certificate rotation broke inter-service communication",
+    "symptoms": "Multiple services unable to communicate, 503 errors on all inter-service calls",
+    "service": "service-mesh",
+    "root_cause": "Istio certificate rotation updated certs on 60% of pods but rotation script failed midway leaving mismatched certs",
+    "investigation_steps": [
+      "All inter-service calls failing with certificate verify failed errors",
+      "Istio cert rotation script had run and partially completed before script error",
+      "60% of pods had new cert, 40% had old cert — mTLS verification failing between mismatched pods",
+      "Istio pilot logs showed certificate distribution errors on 12 specific pods"
+    ],
+    "resolution_steps": [
+      "Identify pods with old certs: istioctl proxy-status | grep STALE",
+      "Force cert rotation on remaining pods: istioctl proxy-config secret <pod> to check each",
+      "Restart pods with stale certs: kubectl rollout restart deployment for each affected service",
+      "Verify all pods show current cert in istioctl proxy-status",
+      "Confirm inter-service calls working: test with curl between services",
+      "Fix rotation script to be atomic — all or nothing, with rollback on partial failure"
+    ],
+    "resolution_type": "cert_rotation_recovery",
+    "tags": ["service-mesh", "istio", "mtls", "certificate", "inter-service"],
+    "severity": "critical",
+    "time_to_resolve_minutes": 44
+  },
+  {
+    "id": "INC-029",
+    "title": "Search autocomplete slow — Elasticsearch heap pressure",
+    "symptoms": "Search autocomplete taking 3-5 seconds instead of under 100ms, partial UI freezes",
+    "service": "search-service",
+    "root_cause": "Elasticsearch JVM heap at 95% causing frequent GC pauses, triggered by large aggregation query added to autocomplete",
+    "investigation_steps": [
+      "Elasticsearch cluster health showed yellow — heap usage at 95% on primary shard nodes",
+      "GC logs showed stop-the-world GC pauses every 15-20 seconds",
+      "New autocomplete feature added terms aggregation returning top 10000 suggestions",
+      "Aggregation loading entire suggestion dataset into heap on every autocomplete keypress"
+    ],
+    "resolution_steps": [
+      "Check ES heap: GET /_nodes/stats/jvm via Elasticsearch API, look for heap_used_percent",
+      "Check GC pressure: GET /_nodes/stats/jvm and look at gc.collectors.old.collection_time_in_millis",
+      "Immediate relief: reduce aggregation size from 10000 to 20 in autocomplete query",
+      "Deploy reduced aggregation as hotfix — autocomplete quality unaffected for top results",
+      "Long term: use Elasticsearch completion suggester instead of terms aggregation",
+      "Increase ES heap allocation from 4GB to 8GB to give headroom"
+    ],
+    "resolution_type": "query_optimise_and_scale",
+    "tags": ["elasticsearch", "search-service", "heap", "gc-pressure", "autocomplete"],
+    "severity": "medium",
+    "time_to_resolve_minutes": 26
+  },
+  {
+    "id": "INC-030",
+    "title": "Kubernetes node NotReady — kubelet OOM on high pod density node",
+    "symptoms": "Several pods evicted, services degraded, one cluster node showing NotReady status",
+    "service": "infrastructure",
+    "root_cause": "Kubelet process OOMKilled on node running 45 pods — node memory limits too low for pod density",
+    "investigation_steps": [
+      "kubectl get nodes showed one node in NotReady state",
+      "kubectl describe node showed MemoryPressure condition true",
+      "Node had 45 pods scheduled — above recommended density for 8GB node",
+      "Kubelet process itself was OOMKilled by the kernel — node lost control plane communication"
+    ],
+    "resolution_steps": [
+      "Confirm node status: kubectl get nodes and kubectl describe node <node-name>",
+      "Check memory pressure events: kubectl describe node | grep -A5 MemoryPressure",
+      "Cordon node to prevent new pods scheduling: kubectl cordon <node-name>",
+      "Drain evictable pods: kubectl drain <node-name> --ignore-daemonsets --delete-emptydir-data",
+      "SSH to node and restart kubelet: systemctl restart kubelet",
+      "Once node Ready, uncordon: kubectl uncordon <node-name>",
+      "Long term: reduce max pods per node or increase node memory from 8GB to 16GB"
+    ],
+    "resolution_type": "node_recovery",
+    "tags": ["kubernetes", "infrastructure", "oom", "kubelet", "node-pressure"],
+    "severity": "high",
+    "time_to_resolve_minutes": 29
+  }
+]
