@@ -73,34 +73,33 @@ TOOL_DEFINITIONS = [
         }
     },
     {
-        "type": "function",
-        "function": {
-            "name": "search_past_incidents",
-            "description": (
-                "Search the knowledge base of past resolved incidents for ones similar "
-                "to the current issue. Always call this after you have a hypothesis — "
-                "past incidents often contain the exact resolution steps needed."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Natural language description of the current issue"
-                    },
-                    "top_k": {
-                        "type": "integer",
-                        "description": "Number of similar incidents to return. Default 3."
-                    },
-                    "service_filter": {
-                        "type": "string",
-                        "description": "Optional: limit search to a specific service name"
-                    }
-                },
-                "required": ["query"]
-            }
+    "type": "function",
+    "function": {
+        "name": "search_past_incidents",
+        "description": (
+            "Search the knowledge base of past resolved incidents for ones similar "
+            "to the current issue. Always call this after you have a hypothesis — "
+            "past incidents often contain the exact resolution steps needed. "
+            "Pass a natural language description of the symptoms you observed."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "Natural language description of the current issue. "
+                        "Example: 'postgresql connection pool exhausted auth-service'"
+                    )
+                }
+            },
+            "required": ["query"]
+            # Removed top_k and service_filter — LLaMA gets confused with
+            # too many optional params and generates malformed JSON arrays.
+            # Defaults are handled inside the Python function directly.
         }
-    },
+    }
+    }, 
     {
         "type": "function",
         "function": {
@@ -165,44 +164,86 @@ def execute_tool(tool_name: str, tool_input: dict) -> str:
     elif tool_name == "check_metrics":
         return check_metrics(**tool_input)
     elif tool_name == "search_past_incidents":
-        return search_past_incidents(**tool_input)
+    # LLM only passes query now — we set sensible defaults here
+        return search_past_incidents(
+            query=tool_input.get("query", ""),
+            top_k=3,
+            service_filter=None
+        )
     elif tool_name == "generate_report":
         return generate_report(**tool_input)
     else:
         return f"Unknown tool: {tool_name}"
 
 
-SYSTEM_PROMPT = """You are an expert Site Reliability Engineer investigating support tickets.
+# Changes to agent/investigation_agent.py
+# Only showing what changes — keep everything else the same
 
-Follow this investigation process strictly:
-1. Fetch logs for the affected service first
-2. Check metrics for that service
-3. Search past incidents for similar issues
-4. Generate the resolution report with your findings
+# ── Update the system prompt to reference triage context ──────────────────
 
-Never skip steps. Never generate the report before checking logs, metrics, and past incidents.
+SYSTEM_PROMPT = """You are an expert Site Reliability Engineer (SRE) investigating support tickets.
+
+You will be given a ticket along with triage context (priority, category, affected service).
+Use this context to focus your investigation — don't re-classify what triage already determined.
+
+Your job is to investigate thoroughly and produce a resolution report.
+You NEVER guess. You always gather evidence first.
+
+Follow this investigation process:
+1. Fetch logs for the affected service identified in triage
+2. Check metrics for that same service
+3. Search past incidents using the symptoms and category from triage
+4. Once you have enough evidence, generate the resolution report
+
+Rules:
+- Always call fetch_logs and check_metrics before forming a conclusion
+- Always call search_past_incidents with a meaningful query
+- Only call generate_report when you have clear evidence for the root cause
+- Use the priority from triage in your report — do not change it
+- The resolution_steps must be specific commands a human can run immediately
+- Never take actions — you only investigate and report
 """
 
 
-def run_agent(ticket_id: str, ticket_text: str) -> str:
+# ── Update run_agent() to accept and use triage_result ────────────────────
+
+def run_agent(ticket_id: str, ticket_text: str, triage_result: dict = None) -> str:
+    """
+    Run the full investigation for a ticket.
+    Accepts optional triage_result from the triage agent.
+    Returns the final JSON resolution report.
+    """
     client = Groq()
 
     print(f"\n{'='*60}")
     print(f"🎫 Investigating ticket: {ticket_id}")
-    print(f"📋 {ticket_text}")
     print(f"{'='*60}")
 
-    # ── Groq difference 1: system goes inside messages list ──────────────────
+    # Build the first user message
+    # If we have triage context, include it so the agent starts focused
+    if triage_result:
+        user_message = (
+            f"Please investigate this support ticket and generate a resolution report.\n\n"
+            f"Ticket ID: {ticket_id}\n"
+            f"Description: {ticket_text}\n\n"
+            f"--- Triage Context (already determined) ---\n"
+            f"Priority:         {triage_result.get('priority', 'unknown')}\n"
+            f"Category:         {triage_result.get('category', 'unknown')}\n"
+            f"Affected Service: {triage_result.get('affected_service', 'unknown')}\n"
+            f"Summary:          {triage_result.get('summary', '')}\n"
+            f"-------------------------------------------\n\n"
+            f"Start by fetching logs for the affected service above."
+        )
+    else:
+        user_message = (
+            f"Please investigate this support ticket and generate a resolution report.\n\n"
+            f"Ticket ID: {ticket_id}\n"
+            f"Description: {ticket_text}"
+        )
+
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": (
-                f"Please investigate this support ticket and generate a resolution report.\n\n"
-                f"Ticket ID: {ticket_id}\n"
-                f"Description: {ticket_text}"
-            )
-        }
+        {"role": "user",   "content": user_message}
     ]
 
     final_report = None
@@ -213,7 +254,6 @@ def run_agent(ticket_id: str, ticket_text: str) -> str:
         iteration += 1
         print(f"\n--- Iteration {iteration} ---")
 
-        # ── Groq difference 2: different client call ─────────────────────────
         response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=messages,
@@ -224,9 +264,7 @@ def run_agent(ticket_id: str, ticket_text: str) -> str:
         choice = response.choices[0]
         print(f"  Stop reason: {choice.finish_reason}")
 
-        # ── Groq difference 3: different stop reason name ────────────────────
         if choice.finish_reason == "stop":
-            # LLM is done, no more tool calls
             if choice.message.content:
                 print(f"\n💬 Agent: {choice.message.content}")
             break
@@ -239,61 +277,41 @@ def run_agent(ticket_id: str, ticket_text: str) -> str:
         if not tool_calls:
             break
 
-        # ── Groq difference 4: append assistant message WITH tool calls ──────
-        # This is required before adding tool results
         messages.append({
-            "role": "assistant",
-            "content": choice.message.content,   # may be None — that's fine
+            "role":       "assistant",
+            "content":    choice.message.content,
             "tool_calls": tool_calls
         })
 
-        # ── THIS IS THE BLOCK YOU NOTICED WAS MISSING ────────────────────────
-        # Same purpose as in the Anthropic version:
-        #   1. Print the LLM's thinking (if any text came with the tool call)
-        #   2. Run each tool via execute_tool()
-        #   3. Check if generate_report was called → set final_report
-        #   4. Collect all results to send back to the LLM
-        # ─────────────────────────────────────────────────────────────────────
-
         for tool_call in tool_calls:
 
-            # 1. Print thinking — in Groq, text comes in choice.message.content
             if choice.message.content:
                 print(f"\n🧠 Thinking: {choice.message.content[:200]}")
 
             tool_name = tool_call.function.name
 
-            # ── Groq difference 5: arguments come as a JSON STRING ────────────
-            # Anthropic gives a ready dict. Groq gives a string you must parse.
             try:
                 tool_input = json.loads(tool_call.function.arguments)
             except json.JSONDecodeError as e:
                 print(f"  ⚠️ Failed to parse tool arguments: {e}")
-                tool_input = {}   # safe fallback
+                tool_input = {}
 
-            # 2. Run the actual tool — same execute_tool() as Anthropic version
             result = execute_tool(tool_name, tool_input)
 
-            # 3. Check if investigation is complete
             if tool_name == "generate_report":
                 final_report = result
                 print(f"\n✅ Report generated!")
 
-            # ── Groq difference 6: results go as separate "tool" role messages
-            # Anthropic bundles them as user turn blocks.
-            # Groq wants one message per tool result with role="tool"
             messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call.id,   # links result to the request
-                "content": result
+                "role":         "tool",
+                "tool_call_id": tool_call.id,
+                "content":      result
             })
 
-        # 4. If we have the final report, stop the loop
         if final_report:
             break
 
     return final_report or "Investigation did not produce a report."
-
 
 if __name__ == "__main__":
     report = run_agent(
