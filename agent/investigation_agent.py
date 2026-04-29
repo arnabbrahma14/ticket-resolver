@@ -1,4 +1,4 @@
-# agent/investigation_agent_groq.py
+# agent/investigation_agent.py
 
 import os
 os.environ["ANONYMIZED_TELEMETRY"] = "False"
@@ -14,12 +14,15 @@ from tools.fetch_logs import fetch_logs
 from tools.check_metrics import check_metrics
 from tools.search_incidents import search_past_incidents
 from tools.generate_report import generate_report
+from agent.memory import ShortTermMemory, get_service_history, save_investigation
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Tool definitions stay EXACTLY the same as Anthropic version
-# Groq format — note the wrapper and the renamed key
+# ─────────────────────────────────────────────────────────────────────────────
+# TOOL DEFINITIONS
+# ─────────────────────────────────────────────────────────────────────────────
+
 TOOL_DEFINITIONS = [
     {
         "type": "function",
@@ -30,7 +33,7 @@ TOOL_DEFINITIONS = [
                 "Use this first when investigating any incident to understand "
                 "what errors appeared and when. Filter by severity to focus on errors."
             ),
-            "parameters": {                    # ← was input_schema in Anthropic
+            "parameters": {
                 "type": "object",
                 "properties": {
                     "service": {
@@ -73,118 +76,175 @@ TOOL_DEFINITIONS = [
         }
     },
     {
-    "type": "function",
-    "function": {
-        "name": "search_past_incidents",
-        "description": (
-            "Search the knowledge base of past resolved incidents for ones similar "
-            "to the current issue. Always call this after you have a hypothesis — "
-            "past incidents often contain the exact resolution steps needed. "
-            "Pass a natural language description of the symptoms you observed."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": (
-                        "Natural language description of the current issue. "
-                        "Example: 'postgresql connection pool exhausted auth-service'"
-                    )
-                }
-            },
-            "required": ["query"]
-            # Removed top_k and service_filter — LLaMA gets confused with
-            # too many optional params and generates malformed JSON arrays.
-            # Defaults are handled inside the Python function directly.
-        }
-    }
-    }, 
-    {
         "type": "function",
         "function": {
-            "name": "generate_report",
+            "name": "search_past_incidents",
             "description": (
-                "Generate the final structured resolution report. Call this ONLY when "
-                "you have completed your investigation and have enough evidence to "
-                "diagnose the root cause and recommend resolution steps. "
-                "This ends the investigation."
+                "Search the knowledge base of past resolved incidents for ones similar "
+                "to the current issue. Always call this after you have a hypothesis — "
+                "past incidents often contain the exact resolution steps needed. "
+                "Pass a natural language description of the symptoms you observed."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "ticket_id":           {"type": "string"},
-                    "service":             {"type": "string"},
-                    "priority":            {"type": "string", "enum": ["critical", "high", "medium", "low"]},
-                    "category":            {"type": "string"},
-                    "root_cause":          {"type": "string"},
-                    "confidence":          {"type": "string", "enum": ["high", "medium", "low"]},
-                    "supporting_evidence": {"type": "array", "items": {"type": "string"}},
-                    "resolution_steps": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "step":            {"type": "integer"},
-                                "action":          {"type": "string"},
-                                "command":         {"type": "string"},
-                                "expected_result": {"type": "string"}
-                            }
-                        }
-                    },
-                    "similar_incidents": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "id":                  {"type": "string"},
-                                "similarity":          {"type": "string"},
-                                "resolution_summary":  {"type": "string"}
-                            }
-                        }
-                    },
-                    "fallback_advice": {"type": "string"}
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "Natural language description of the current issue. "
+                            "Example: 'postgresql connection pool exhausted auth-service'"
+                        )
+                    }
                 },
-                "required": [
-                    "ticket_id", "service", "priority", "category",
-                    "root_cause", "confidence", "supporting_evidence",
-                    "resolution_steps", "similar_incidents"
-                ]
+                "required": ["query"]
             }
         }
+    },
+    {
+    "type": "function",
+    "function": {
+        "name": "generate_report",
+        "description": (
+            "Generate the final structured resolution report. Call this ONLY when "
+            "you have completed your investigation and have enough evidence to "
+            "diagnose the root cause and recommend resolution steps. "
+            "This ends the investigation."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ticket_id": {
+                    "type": "string",
+                    "description": "The ticket ID, e.g. TKT-4821"
+                },
+                "service": {
+                    "type": "string",
+                    "description": "The affected service name"
+                },
+                "priority": {
+                    "type": "string",
+                    "description": "critical, high, medium, or low"
+                },
+                "category": {
+                    "type": "string",
+                    "description": "database, memory, network, deployment, cache, security, or other"
+                },
+                "root_cause": {
+                    "type": "string",
+                    "description": "One clear sentence describing what went wrong"
+                },
+                "confidence": {
+                    "type": "string",
+                    "description": "high, medium, or low"
+                },
+                "resolution_summary": {
+                    "type": "string",
+                    "description": (
+                        "A detailed description of the resolution steps as plain text. "
+                        "Include specific commands and what to expect after each step."
+                    )
+                },
+                "evidence_summary": {
+                    "type": "string",
+                    "description": (
+                        "A plain text summary of the supporting evidence found during investigation. "
+                        "Include key log findings, metric anomalies, and past incident matches."
+                    )
+                }
+            },
+            "required": [
+                "ticket_id", "service", "priority", "category",
+                "root_cause", "confidence", "resolution_summary", "evidence_summary"
+            ]
+        }
     }
+     }
 ]
 
-# execute_tool is IDENTICAL to the Anthropic version — no changes needed
-def execute_tool(tool_name: str, tool_input: dict) -> str:
+# ─────────────────────────────────────────────────────────────────────────────
+# TOOL EXECUTOR
+# Now accepts short_term_memory so it can note key findings
+# and truncate large results before they go into the messages list
+# ─────────────────────────────────────────────────────────────────────────────
+
+def execute_tool(
+    tool_name:         str,
+    tool_input:        dict,
+    short_term_memory: ShortTermMemory
+) -> str:
+    """
+    Runs the tool and returns the result as a string.
+    Also notes key findings in short-term memory
+    and truncates large results to protect the context window.
+    """
     print(f"\n  🔧 Calling: {tool_name}({json.dumps(tool_input)})")
 
     if tool_name == "fetch_logs":
-        return fetch_logs(**tool_input)
+        result = fetch_logs(**tool_input)
+
+        # Note the first ERROR line as a finding — concise signal for the LLM
+        if "ERROR" in result:
+            first_error = next(
+                (line for line in result.splitlines() if "ERROR" in line),
+                ""
+            )
+            # next() returns the first matching item from the iterator
+            # The "" is the default if nothing matches
+            short_term_memory.add_finding(f"Logs: {first_error[:120]}")
+
+        # Truncate to 1500 chars — agent gets the signal without flooding context
+        return result[:1500]
+
     elif tool_name == "check_metrics":
-        return check_metrics(**tool_input)
+        result = check_metrics(**tool_input)
+
+        # Note critical metrics as a finding
+        if "CRITICAL" in result:
+            critical_lines = [
+                line for line in result.splitlines()
+                if "CRITICAL" in line
+            ]
+            if critical_lines:
+                short_term_memory.add_finding(
+                    f"Metrics: {' | '.join(critical_lines[:3])}"
+                )
+
+        return result
+
     elif tool_name == "search_past_incidents":
-    # LLM only passes query now — we set sensible defaults here
-        return search_past_incidents(
+        # Only pass query — top_k and service_filter hardcoded here
+        # Avoids Groq/LLaMA optional param bug that generates malformed JSON arrays
+        result = search_past_incidents(
             query=tool_input.get("query", ""),
             top_k=3,
             service_filter=None
         )
+
+        # Note if a strong match was found (80%+ similarity)
+        if "Similarity: 8" in result or "Similarity: 9" in result:
+            short_term_memory.add_finding(
+                "Strong past incident match found — check resolution steps"
+            )
+
+        # Past incidents can be very long — truncate to 2000 chars
+        return result[:2000]
+
     elif tool_name == "generate_report":
         return generate_report(**tool_input)
+
     else:
         return f"Unknown tool: {tool_name}"
 
 
-# Changes to agent/investigation_agent.py
-# Only showing what changes — keep everything else the same
-
-# ── Update the system prompt to reference triage context ──────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# SYSTEM PROMPT
+# ─────────────────────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """You are an expert Site Reliability Engineer (SRE) investigating support tickets.
 
 You will be given a ticket along with triage context (priority, category, affected service).
 Use this context to focus your investigation — don't re-classify what triage already determined.
+You may also be given past investigation history for the affected service — use it to spot patterns.
 
 Your job is to investigate thoroughly and produce a resolution report.
 You NEVER guess. You always gather evidence first.
@@ -200,27 +260,53 @@ Rules:
 - Always call search_past_incidents with a meaningful query
 - Only call generate_report when you have clear evidence for the root cause
 - Use the priority from triage in your report — do not change it
+- If this looks like a recurring issue based on history, mention it in the report
 - The resolution_steps must be specific commands a human can run immediately
 - Never take actions — you only investigate and report
 """
 
 
-# ── Update run_agent() to accept and use triage_result ────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# THE REACT LOOP — updated for Phase 5 memory
+# ─────────────────────────────────────────────────────────────────────────────
 
-def run_agent(ticket_id: str, ticket_text: str, triage_result: dict = None) -> str:
+def run_agent(
+    ticket_id:     str,
+    ticket_text:   str,
+    triage_result: dict = None
+) -> str:
     """
     Run the full investigation for a ticket.
-    Accepts optional triage_result from the triage agent.
+    Uses short-term memory to track findings and manage context window.
+    Uses long-term memory to provide service history and save results.
     Returns the final JSON resolution report.
     """
     client = Groq()
+
+    # ── Get service name from triage ─────────────────────────────────────────
+    service = (
+        triage_result.get("affected_service", "unknown")
+        if triage_result else "unknown"
+    )
+
+    # ── Initialise short-term memory for this investigation ──────────────────
+    stm = ShortTermMemory(ticket_id, service)
 
     print(f"\n{'='*60}")
     print(f"🎫 Investigating ticket: {ticket_id}")
     print(f"{'='*60}")
 
-    # Build the first user message
-    # If we have triage context, include it so the agent starts focused
+    # ── Fetch long-term memory for this service ──────────────────────────────
+    service_history = get_service_history(service)
+    has_history     = "No previous investigations" not in service_history
+
+    if has_history:
+        print(f"\n📚 Long-term memory found for '{service}'")
+        print(service_history[:300])
+    else:
+        print(f"\n📭 No previous history for '{service}' — fresh investigation")
+
+    # ── Build first user message ──────────────────────────────────────────────
     if triage_result:
         user_message = (
             f"Please investigate this support ticket and generate a resolution report.\n\n"
@@ -229,30 +315,57 @@ def run_agent(ticket_id: str, ticket_text: str, triage_result: dict = None) -> s
             f"--- Triage Context (already determined) ---\n"
             f"Priority:         {triage_result.get('priority', 'unknown')}\n"
             f"Category:         {triage_result.get('category', 'unknown')}\n"
-            f"Affected Service: {triage_result.get('affected_service', 'unknown')}\n"
+            f"Affected Service: {service}\n"
             f"Summary:          {triage_result.get('summary', '')}\n"
             f"-------------------------------------------\n\n"
-            f"Start by fetching logs for the affected service above."
         )
     else:
         user_message = (
             f"Please investigate this support ticket and generate a resolution report.\n\n"
             f"Ticket ID: {ticket_id}\n"
-            f"Description: {ticket_text}"
+            f"Description: {ticket_text}\n\n"
         )
+
+    # ── Inject long-term memory if available ─────────────────────────────────
+    if has_history:
+        user_message += (
+            f"--- Service History (from long-term memory) ---\n"
+            f"{service_history}\n"
+            f"Use this history to identify recurring patterns. "
+            f"If this looks like a repeat incident, mention it clearly in your report.\n"
+            f"-----------------------------------------------\n\n"
+        )
+
+    user_message += "Start by fetching logs for the affected service above."
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user",   "content": user_message}
     ]
 
-    final_report = None
+    final_report  = None
     max_iterations = 10
-    iteration = 0
+    iteration      = 0
 
+    # ── ReAct loop ────────────────────────────────────────────────────────────
     while iteration < max_iterations:
         iteration += 1
         print(f"\n--- Iteration {iteration} ---")
+
+        # ── Inject short-term memory summary on even iterations ───────────────
+        # This is Strategy 4 from Phase 3 — running summary
+        # Instead of keeping full tool outputs in messages, we inject
+        # a compact findings summary so the LLM never loses track of key signals
+        if iteration > 1 and iteration % 2 == 0:
+            # iteration % 2 == 0 means every even number: 2, 4, 6...
+            messages.append({
+                "role":    "user",
+                "content": (
+                    f"Quick summary of findings so far:\n"
+                    f"{stm.get_summary()}\n"
+                    f"Continue the investigation."
+                )
+            })
 
         response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
@@ -277,6 +390,7 @@ def run_agent(ticket_id: str, ticket_text: str, triage_result: dict = None) -> s
         if not tool_calls:
             break
 
+        # Append assistant message WITH tool calls before adding results
         messages.append({
             "role":       "assistant",
             "content":    choice.message.content,
@@ -290,18 +404,21 @@ def run_agent(ticket_id: str, ticket_text: str, triage_result: dict = None) -> s
 
             tool_name = tool_call.function.name
 
+            # Groq returns arguments as a JSON string — must parse
             try:
                 tool_input = json.loads(tool_call.function.arguments)
             except json.JSONDecodeError as e:
                 print(f"  ⚠️ Failed to parse tool arguments: {e}")
                 tool_input = {}
 
-            result = execute_tool(tool_name, tool_input)
+            # Run tool — pass short-term memory so findings are noted
+            result = execute_tool(tool_name, tool_input, stm)
 
             if tool_name == "generate_report":
                 final_report = result
                 print(f"\n✅ Report generated!")
 
+            # Groq: one message per tool result with role="tool"
             messages.append({
                 "role":         "tool",
                 "tool_call_id": tool_call.id,
@@ -311,7 +428,30 @@ def run_agent(ticket_id: str, ticket_text: str, triage_result: dict = None) -> s
         if final_report:
             break
 
+    # ── Save to long-term memory when investigation completes ─────────────────
+    # At the bottom of run_agent() — replace the save block with this
+    if final_report:
+        try:
+            report_dict = json.loads(final_report)
+            save_investigation(
+            ticket_id=ticket_id,
+            service=service,
+            priority=report_dict.get("triage", {}).get("priority", "unknown"),
+            category=report_dict.get("triage", {}).get("category", "unknown"),
+            root_cause=report_dict.get("diagnosis", {}).get("most_likely_root_cause", ""),
+            resolution_type="agent_investigation",
+            summary=report_dict.get("diagnosis", {}).get("confidence", "unknown")
+            # simplified — no longer looking for resolution_steps list
+        )
+        except Exception as e:
+            print(f"  ⚠️ Could not save to long-term memory: {e}")
+
     return final_report or "Investigation did not produce a report."
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI RUNNER
+# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     report = run_agent(
@@ -326,4 +466,3 @@ if __name__ == "__main__":
     print("📄 FINAL RESOLUTION REPORT")
     print("="*60)
     print(report)
-    
