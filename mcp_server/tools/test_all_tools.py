@@ -3,10 +3,10 @@
 import os
 os.environ["ANONYMIZED_TELEMETRY"] = "False"
 
-from fetch_logs        import fetch_logs
-from check_metrics     import check_metrics
-from search_incidents  import search_past_incidents
-from generate_report   import generate_report
+from mcp_server.tools.fetch_logs        import fetch_logs
+from mcp_server.tools.check_metrics     import check_metrics
+from mcp_server.tools.search_incidents  import search_past_incidents
+from mcp_server.tools.generate_report   import generate_report
 from rich import print
 
 print("\n[bold green]═══ Testing all 4 tools ═══[/bold green]\n")

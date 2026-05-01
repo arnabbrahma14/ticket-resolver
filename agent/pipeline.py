@@ -6,6 +6,7 @@ import os
 os.environ["ANONYMIZED_TELEMETRY"] = "False"
 
 import sys
+import asyncio                          # PHASE 6: added for async support
 from pathlib import Path
 sys.path.append(str(Path(__file__).parent.parent))
 
@@ -14,7 +15,7 @@ from agent.investigation_agent import run_agent
 import json
 
 
-def process_ticket(ticket_id: str, ticket_text: str) -> str:
+async def process_ticket(ticket_id: str, ticket_text: str) -> str:  # PHASE 6: now async
     """
     Full pipeline:
       1. Triage agent classifies the ticket
@@ -23,7 +24,7 @@ def process_ticket(ticket_id: str, ticket_text: str) -> str:
     """
 
     # ── Step 1: Triage ────────────────────────────────────────────────────────
-    triage_result = run_triage(ticket_id, ticket_text)
+    triage_result = run_triage(ticket_id, ticket_text)  # triage stays sync — no change
 
     print(f"\n{'─'*60}")
     print(f"📋 Triage complete. Priority: {triage_result['priority'].upper()}")
@@ -31,24 +32,47 @@ def process_ticket(ticket_id: str, ticket_text: str) -> str:
     print(f"{'─'*60}")
 
     # ── Optional: skip investigation for low priority tickets ─────────────────
-    # In a real system you might queue low priority tickets instead of
-    # investigating them immediately. For now we investigate everything.
     if triage_result["priority"] == "low":
         print("ℹ️  Low priority ticket — investigation will still run for learning purposes.")
 
     # ── Step 2: Investigation ─────────────────────────────────────────────────
-    report = run_agent(
+    report = await run_agent(                           # PHASE 6: await added
         ticket_id=ticket_id,
         ticket_text=ticket_text,
-        triage_result=triage_result      # pass triage context to investigation
+        triage_result=triage_result
     )
 
     return report
 
 
+async def run_all_tickets(test_cases):                  # PHASE 6: async wrapper for the loop
+    for ticket in test_cases:
+        print(f"\n{'#'*60}")
+        print(f"# NEW TICKET: {ticket['id']}")
+        print(f"{'#'*60}")
+
+        report = await process_ticket(ticket["id"], ticket["text"])
+
+        print(f"\n{'='*60}")
+        print(f"📄 FINAL RESOLUTION REPORT — {ticket['id']}")
+        print(f"{'='*60}")
+
+        # In pipeline.py — replace the pretty-print block with this:
+
+    try:
+        # MCP returns results as JSON strings — may need double-parsing
+        parsed = json.loads(report)
+        if isinstance(parsed, str):
+            parsed = json.loads(parsed)   # unwrap the extra layer
+        print(json.dumps(parsed, indent=2))
+    except Exception:
+        print(report)
+
+        print("\n")
+
+
 if __name__ == "__main__":
 
-    # Test tickets — different categories to see triage working
     test_cases = [
         {
             "id":   "TKT-4821",
@@ -66,22 +90,4 @@ if __name__ == "__main__":
         }
     ]
 
-    for ticket in test_cases:
-        print(f"\n{'#'*60}")
-        print(f"# NEW TICKET: {ticket['id']}")
-        print(f"{'#'*60}")
-
-        report = process_ticket(ticket["id"], ticket["text"])
-
-        print(f"\n{'='*60}")
-        print(f"📄 FINAL RESOLUTION REPORT — {ticket['id']}")
-        print(f"{'='*60}")
-
-        # Pretty print the JSON report
-        try:
-            print(json.dumps(json.loads(report), indent=2))
-        except Exception:
-            print(report)
-
-        print("\n")
-        
+    asyncio.run(run_all_tickets(test_cases))            # PHASE 6: asyncio.run() here
