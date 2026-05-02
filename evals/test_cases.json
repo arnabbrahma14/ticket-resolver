@@ -1,0 +1,134 @@
+[
+  {
+    "id": "eval-001",
+    "ticket": {
+      "id": "TKT-eval-001",
+      "title": "auth-service returning 500 errors, users cannot log in",
+      "description": "Started at 02:00 AM. All login attempts failing with 500. Affecting all users.",
+      "service": "auth-service",
+      "priority": "CRITICAL"
+    },
+    "expected": {
+      "root_cause_keywords": [
+        "connection pool",
+        "postgresql",
+        "exhausted",
+        "database"
+      ],
+      "required_steps_keywords": [
+        "restart",
+        "connection limit",
+        "rollback",
+        "pool"
+      ],
+      "should_find_past_incident": true,
+      "past_incident_id": "INC-001"
+    }
+  },
+  {
+    "id": "eval-002",
+    "ticket": {
+      "id": "TKT-eval-002",
+      "title": "payment-service latency spike — transactions timing out",
+      "description": "P95 latency jumped from 200ms to 8000ms at 6 PM. Checkout failing for ~30% of users.",
+      "service": "payment-service",
+      "priority": "HIGH"
+    },
+    "expected": {
+      "root_cause_keywords": [
+        "latency",
+        "timeout",
+        "slow query",
+        "database",
+        "memory"
+      ],
+      "required_steps_keywords": [
+        "query",
+        "index",
+        "cache",
+        "rollback",
+        "scale"
+      ],
+      "should_find_past_incident": true,
+      "past_incident_id": "INC-004"
+    }
+  },
+  {
+    "id": "eval-003",
+    "ticket": {
+      "id": "TKT-eval-003",
+      "title": "api-gateway returning 502 Bad Gateway for all downstream services",
+      "description": "502 errors across all endpoints since last deployment at 3 PM. Health checks failing.",
+      "service": "api-gateway",
+      "priority": "CRITICAL"
+    },
+    "expected": {
+      "root_cause_keywords": [
+        "deployment",
+        "misconfiguration",
+        "upstream",
+        "health check",
+        "502"
+      ],
+      "required_steps_keywords": [
+        "rollback",
+        "redeploy",
+        "config",
+        "restart",
+        "upstream"
+      ],
+      "should_find_past_incident": true,
+      "past_incident_id": "INC-007"
+    }
+  },
+  {
+    "id": "eval-004",
+    "ticket": {
+      "id": "TKT-eval-004",
+      "title": "notification-service not sending emails",
+      "description": "Email notifications stopped going out at 10 AM. No errors in UI but emails not received.",
+      "service": "notification-service",
+      "priority": "MEDIUM"
+    },
+    "expected": {
+      "root_cause_keywords": [
+        "smtp",
+        "queue",
+        "rate limit",
+        "email",
+        "provider"
+      ],
+      "required_steps_keywords": [
+        "queue",
+        "retry",
+        "smtp",
+        "credentials",
+        "provider"
+      ],
+      "should_find_past_incident": false,
+      "past_incident_id": null
+    }
+  },
+  {
+    "id": "eval-005",
+    "ticket": {
+      "id": "TKT-eval-005",
+      "title": "data-pipeline memory usage at 98%, OOMKilled twice",
+      "description": "Pod OOMKilled twice in last hour. Processing jobs are backed up. Memory was normal yesterday.",
+      "service": "data-pipeline",
+      "priority": "HIGH"
+    },
+    "expected": {
+      "root_cause_keywords": ["memory", "OOM", "leak", "heap", "batch size"],
+      "required_steps_keywords": [
+        "memory limit",
+        "restart",
+        "batch",
+        "profil",
+        "scale"
+      ],
+      "should_find_past_incident": true,
+      "past_incident_id": "INC-012"
+    }
+  }
+]

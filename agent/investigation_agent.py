@@ -74,20 +74,27 @@ async def execute_tool(
                 )
 
         return result
-
+    
     elif tool_name == "search_past_incidents":
-        # PHASE 6: was search_past_incidents(query=..., top_k=3, service_filter=None)
-        # MCP server handles top_k and service_filter internally — we only pass query
-        result = await call_mcp_tool(
-            "search_past_incidents",
-            {"query": tool_input.get("query", "")}
-        )
-
+        raw_query = tool_input.get("query", "")
+        
+        # Cap query at 80 chars — long queries push LLaMA toward malformed tool call syntax
+        safe_query = raw_query[:80]
+    
+        try:
+            result = await call_mcp_tool(
+                "search_past_incidents",
+                {"query": safe_query}
+            )
+        except Exception as e:
+            print(f"  ⚠️ search_past_incidents failed: {e} — returning empty result")
+            result = "No past incidents found."
+    
         if "Similarity: 8" in result or "Similarity: 9" in result:
             short_term_memory.add_finding(
                 "Strong past incident match found — check resolution steps"
             )
-
+    
         return result[:2000]
 
     elif tool_name == "generate_report":
@@ -237,12 +244,16 @@ async def run_agent(
                 )
             })
 
-        response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=messages,
-            tools=tools,       # PHASE 6: was TOOL_DEFINITIONS (static), now fetched from MCP
-            tool_choice="auto"
-        )
+        try:
+            response = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=messages,
+                tools=tools,
+                tool_choice="auto"
+            )
+        except Exception as e:
+            print(f"  ⚠️ Groq API error: {e} — stopping investigation")
+            break
 
         choice = response.choices[0]
         print(f"  Stop reason: {choice.finish_reason}")
