@@ -16,6 +16,7 @@ from groq import Groq
 # They now live in the MCP server and are called via the MCP protocol.
 from mcp_client import get_mcp_tools, call_mcp_tool
 from agent.memory import ShortTermMemory, get_service_history, save_investigation
+from agent.tool_call_parser import parse_tool_call
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -259,8 +260,56 @@ async def run_agent(
         print(f"  Stop reason: {choice.finish_reason}")
 
         if choice.finish_reason == "stop":
-            if choice.message.content:
-                print(f"\n💬 Agent: {choice.message.content}")
+            content_text = choice.message.content or ""
+
+            # ── Rescue: LLaMA typed the tool call as text instead of invoking it ──
+            # This happens when the system prompt enforced JSON format but Groq's
+            # tool-calling mechanism wasn't triggered — finish_reason is "stop"
+            # but the message body is a JSON tool call like:
+            #   {"name": "fetch_logs", "service": "auth-service", ...}
+            #
+            # We detect this by trying to parse the message as JSON and checking
+            # if it contains a "name" key that matches a known tool.
+            # If it does, we execute it manually exactly as the tool_calls branch
+            # would — keeping the loop alive instead of breaking out.
+            rescued = False
+            if content_text.strip().startswith("{"):
+                try:
+                    parsed_content = json.loads(content_text.strip())
+                    tool_name_candidate = parsed_content.get("name", "")
+                    if tool_name_candidate in [t["function"]["name"] for t in tools]:
+                        print(f"  ⚠️  finish_reason=stop but content is a JSON tool call — rescuing")
+                        tool_name  = tool_name_candidate
+                        # Build tool_input from all keys except "name"
+                        tool_input = {k: v for k, v in parsed_content.items() if k != "name"}
+
+                        # Append the assistant message so the conversation history is intact
+                        messages.append({"role": "assistant", "content": content_text})
+
+                        result = await execute_tool(tool_name, tool_input, stm)
+
+                        if tool_name == "generate_report":
+                            final_report = result
+                            print(f"\n✅ Report generated!")
+
+                        # Feed the result back as a user message (no tool_call_id available
+                        # since Groq didn't give us a structured tool call object here)
+                        messages.append({
+                            "role":    "user",
+                            "content": f"Tool result for {tool_name}:\n{result}\nContinue the investigation."
+                        })
+                        rescued = True
+                except (json.JSONDecodeError, KeyError):
+                    pass
+
+            if rescued:
+                if final_report:
+                    break
+                continue   # go to next iteration with the tool result now in messages
+
+            # Normal stop — LLaMA finished with a plain text conclusion
+            if content_text:
+                print(f"\n💬 Agent: {content_text}")
             break
 
         if choice.finish_reason != "tool_calls":
@@ -283,16 +332,21 @@ async def run_agent(
             if choice.message.content:
                 print(f"\n🧠 Thinking: {choice.message.content[:200]}")
 
-            tool_name = tool_call.function.name
-
-            # Groq returns arguments as a JSON string — must parse
+            # Groq returns arguments as a JSON string — must parse.
+            # If LLaMA produced malformed JSON, fall back to our string parser.
             try:
+                tool_name  = tool_call.function.name
                 tool_input = json.loads(tool_call.function.arguments)
-            except json.JSONDecodeError as e:
-                print(f"  ⚠️ Failed to parse tool arguments: {e}")
-                tool_input = {}
+            except (json.JSONDecodeError, AttributeError):
+                parsed = parse_tool_call(tool_call.function.arguments or "")
+                if parsed:
+                    tool_name  = parsed["tool_name"]
+                    tool_input = parsed["tool_args"]
+                else:
+                    print("  ⚠️ Could not parse tool call — skipping")
+                    continue
 
-            # PHASE 6: execute_tool is now async — must await it
+            # execute_tool runs whether JSON parsing succeeded or fallback was used
             result = await execute_tool(tool_name, tool_input, stm)
 
             if tool_name == "generate_report":
