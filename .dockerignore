@@ -1,0 +1,46 @@
+# .dockerignore
+# Tells Docker what to EXCLUDE from the image build context.
+# Works exactly like .gitignore.
+
+# ── Secrets — NEVER go in an image ──────────────────────────────────────────
+.env
+*.env
+
+# ── Local vector database — too large, replaced by Vertex AI in Phase 8.3 ───
+chroma_db/
+chroma/
+
+# ── Local SQLite memory database — replaced by Firestore in Phase 8.4 ───────
+*.db
+*.sqlite
+
+# ── Python cache — not needed at runtime ────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# ── Virtual environments — container installs its own from requirements.txt ──
+venv/
+.venv/
+env/
+source/
+
+# ── Git history — not needed at runtime ─────────────────────────────────────
+.git/
+.gitignore
+
+# ── GitHub Actions CI config — not needed at runtime ────────────────────────
+.github/
+
+# ── Eval files — not needed at runtime (used only in CI) ────────────────────
+evals/
+
+# ── Editor and OS noise ──────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db
+
+# ── Data seeding scripts — not needed at runtime ─────────────────────────────
+data/seed_vector_db.py

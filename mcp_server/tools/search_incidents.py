@@ -1,82 +1,124 @@
+# mcp_server/tools/search_incidents.py
+# Phase 8.3: Queries Vertex AI Vector Search instead of local ChromaDB.
+# Everything above this layer (MCP server, investigation agent) is unchanged.
+
 import os
-import chromadb
-from chromadb.utils import embedding_functions
-from dotenv import load_dotenv
+os.environ["ANONYMIZED_TELEMETRY"] = "False"
 
-import sys
+import json
 from pathlib import Path
-
-sys.path.append(str(Path(__file__).parent.parent))
+from dotenv import load_dotenv
+import google.generativeai as genai
+from google.cloud import aiplatform
 
 load_dotenv()
 
-os.environ["ANONYMIZED_TELEMETRY"] = "False"
+# ── Config from environment ──────────────────────────────────────────────────
+# These come from .env locally, from Secret Manager in production.
+PROJECT_ID          = os.getenv("VERTEX_PROJECT_ID", "ticket-resolver-arnab")
+LOCATION            = "us-central1"
+INDEX_ENDPOINT_NAME = os.getenv("VERTEX_INDEX_ENDPOINT")
+DEPLOYED_INDEX_ID   = os.getenv("VERTEX_DEPLOYED_INDEX_ID", "incidents_index")
+EMBEDDING_MODEL     = "models/gemini-embedding-001"
 
-CHROMA_PATH = os.getenv("CHROMA_PATH")
+# ── Also load the original incidents JSON so we can return the actual text ───
+# Vertex AI only stores and returns IDs + distances — not the original text.
+# We use the returned IDs to look up the full incident data from the JSON file.
+INCIDENTS_PATH = Path(__file__).parent.parent.parent / "data" / "past_incidents.json"
 
-embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
-    model_name="all-MiniLM-L6-v2"
-)
+with open(INCIDENTS_PATH) as f:
+    ALL_INCIDENTS = json.load(f)
 
-def get_collection():
-    client = chromadb.PersistentClient(path=CHROMA_PATH)
-    return client.get_collection(
-        name="past_incidents",
-        embedding_function=embedding_fn
-    )
+# ── Clients ──────────────────────────────────────────────────────────────────
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+aiplatform.init(project=PROJECT_ID, location=LOCATION)
 
-def search_past_incidents(
-    query: str,
-    top_k: int = 3,
-    service_filter: str = None
-) -> str:
+
+def search_past_incidents(query: str, top_k: int = 3, service_filter=None) -> str:
     """
-    Search past resolved incidents relevant to the current query.
-    Returns formatted text ready for the LLM to reason over.
+    Searches past incidents using Vertex AI Vector Search (semantic similarity).
+    
+    Phase 8.3 replacement for the ChromaDB-based version.
+    Same function signature — the MCP server and agent don't need to change.
+
+    Args:
+        query:          Natural language description of the current problem.
+        top_k:          Number of similar incidents to return.
+        service_filter: Optional service name to filter results (not used in
+                        this implementation — kept for API compatibility).
+
+    Returns:
+        A formatted string of the most similar past incidents.
     """
-    collection = get_collection()
 
-    where_filter = {"service": service_filter} if service_filter else None
+    # ── Step 1: Embed the query ───────────────────────────────────────────────
+    # We embed it as RETRIEVAL_QUERY (not RETRIEVAL_DOCUMENT) because we're
+    # searching, not indexing. Gemini uses different internal representations
+    # for these two task types.
+    try:
+        result = genai.embed_content(
+            model=EMBEDDING_MODEL,
+            content=query,
+            task_type="RETRIEVAL_QUERY",
+        )
+        query_embedding = result["embedding"]
 
-    results = collection.query(
-        query_texts=[query],
-        n_results=top_k,
-        where=where_filter,
-        include=["documents", "metadatas", "distances"]
-    )
+    except Exception as e:
+        return f"ERROR: Failed to embed query: {e}"
 
-    if not results["documents"][0]:
-        return "No similar past incidents found."
-
-    lines = ["=== Similar Past Incidents ===\n"]
-
-    for doc, meta, dist in zip(
-        results["documents"][0],
-        results["metadatas"][0],
-        results["distances"][0]
-    ):
-        similarity = round((1 - dist) * 100, 1)
-        lines.append(
-            f"[{meta['service']}] — Similarity: {similarity}% "
-            f"| Severity: {meta['severity']} "
-            f"| Resolved in: {meta['time_to_resolve']} mins\n"
-            f"{doc}\n"
-            f"{'-' * 60}"
+    # ── Step 2: Query the Vertex AI index endpoint ────────────────────────────
+    # MatchingEngineIndexEndpoint.find_neighbors() sends the embedding to the
+    # deployed index and returns the nearest neighbours as (id, distance) pairs.
+    try:
+        endpoint = aiplatform.MatchingEngineIndexEndpoint(
+            index_endpoint_name=INDEX_ENDPOINT_NAME
         )
 
-    return "\n".join(lines)
+        # find_neighbors() is the actual search call.
+        # It returns a list of lists — one list per query vector.
+        # Since we're sending one query, we take [0].
+        response = endpoint.find_neighbors(
+            deployed_index_id=DEPLOYED_INDEX_ID,
+            queries=[query_embedding],
+            num_neighbors=top_k,
+        )
 
+        # response[0] is the list of neighbours for our single query
+        neighbours = response[0]
 
-if __name__ == "__main__":
-    # Test queries — run this to verify retrieval is working
-    test_queries = [
-        "database connection timeout errors login failing",
-        "service running out of memory crashing repeatedly",
-        "payment processing slow users cannot checkout",
-        "search returning wrong or outdated results",
-        "ssl certificate error https not working"
-    ]
+    except Exception as e:
+        return f"ERROR: Failed to query Vertex AI Vector Search: {e}"
 
-    for query in test_queries:
-        print(f"\n[bold cyan]Query:[/bold cyan] {query}")
-        print(search_past_incidents(query, top_k=2))
+    if not neighbours:
+        return "No similar past incidents found."
+
+    # ── Step 3: Look up the full incident text by ID ──────────────────────────
+    # Vertex AI returns IDs (e.g. "000042") and distances.
+    # We use the ID as an index into ALL_INCIDENTS to get the full text.
+    results = []
+
+    for neighbour in neighbours:
+        # neighbour.id is the string ID we wrote during embedding ("000042")
+        # Convert to int to index into the list
+        incident_idx = int(neighbour.id)
+
+        if incident_idx >= len(ALL_INCIDENTS):
+            continue
+
+        incident = ALL_INCIDENTS[incident_idx]
+        distance = neighbour.distance
+
+        # Format just like the old ChromaDB version so the agent sees
+        # exactly the same output format it was already trained on
+        results.append(
+            f"[Similarity: {distance:.3f}]\n"
+            f"Title: {incident.get('title', 'Unknown')}\n"
+            f"Service: {incident.get('service', 'Unknown')}\n"
+            f"Root cause: {incident.get('root_cause', 'Unknown')}\n"
+            f"Resolution: {incident.get('resolution', 'Unknown')}\n"
+        )
+
+    if not results:
+        return "No matching incidents found after ID lookup."
+
+    return "\n---\n".join(results)

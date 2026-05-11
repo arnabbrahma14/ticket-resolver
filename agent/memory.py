@@ -1,70 +1,38 @@
 # agent/memory.py
+# Phase 8.4: SQLite replaced with Firestore.
+# Every function signature and return value is IDENTICAL to the Phase 5 version.
+# The agent, triage agent, and pipeline import from this file unchanged.
+#
+# What changed:     SQLite file operations → Firestore document operations
+# What didn't:      Function names, parameters, return types, ShortTermMemory class
 
 import os
 os.environ["ANONYMIZED_TELEMETRY"] = "False"
 
-import sqlite3
-import json
 from datetime import datetime, timezone
-from pathlib import Path
+from dotenv import load_dotenv
+from google.cloud import firestore
+
+load_dotenv()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DATABASE SETUP
-# SQLite is a file-based database — no server needed.
-# The entire DB lives in one file: memory.db in your project root.
-# In Phase 8 this gets swapped to Firestore on GCP — same logic, different backend.
+# Firestore is a managed NoSQL document database on GCP.
+# No file path needed — the client connects over HTTP automatically.
+# Locally it uses GOOGLE_APPLICATION_CREDENTIALS.
+# On Cloud Run it uses the attached service account (ticket-resolver-sa).
 # ─────────────────────────────────────────────────────────────────────────────
 
-DB_PATH = Path(__file__).parent.parent / "memory.db"
-# Path(__file__) = agent/memory.py
-# .parent       = agent/
-# .parent       = ticket-resolver/   ← project root
-# / "memory.db" = ticket-resolver/memory.db
+# firestore.Client() creates a connection to your GCP Firestore database.
+# project= tells it which GCP project to connect to.
+db = firestore.Client(project=os.getenv("VERTEX_PROJECT_ID", "ticket-resolver-arnab"))
 
+# COLLECTION is the Firestore equivalent of a SQL table name.
+# All investigation documents live inside this collection.
+COLLECTION = "investigations"
 
-def get_connection() -> sqlite3.Connection:
-    """
-    Open a connection to the SQLite database.
-    Creates the file automatically if it doesn't exist.
-    """
-    conn = sqlite3.connect(str(DB_PATH))
-
-    # This makes rows behave like dictionaries
-    # so you can write row["service"] instead of row[0]
-    conn.row_factory = sqlite3.Row
-
-    return conn
-
-
-def initialise_db():
-    """
-    Create the tables if they don't already exist.
-    Safe to call every time the app starts — IF NOT EXISTS prevents duplicates.
-    """
-    conn = get_connection()
-
-    # cursor is the object you use to run SQL commands
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS investigations (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            ticket_id       TEXT NOT NULL,
-            service         TEXT NOT NULL,
-            priority        TEXT,
-            category        TEXT,
-            root_cause      TEXT,
-            resolution_type TEXT,
-            summary         TEXT,
-            created_at      TEXT NOT NULL
-        )
-    """)
-    # INTEGER PRIMARY KEY AUTOINCREMENT = auto-incrementing unique row ID
-    # TEXT NOT NULL = required string field
-    # TEXT = optional string field
-
-    conn.commit()   # save the changes
-    conn.close()    # release the connection
+# No initialise_db() needed — Firestore creates collections and documents
+# automatically when you first write to them. No schema to define upfront.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -82,74 +50,102 @@ def save_investigation(
     summary:         str
 ):
     """
-    Persist a completed investigation to the database.
+    Persist a completed investigation to Firestore.
     Called at the end of every successful run_agent() call.
+
+    SQLite equivalent:
+        INSERT INTO investigations (...) VALUES (...)
+
+    Firestore equivalent:
+        db.collection("investigations").document(ticket_id).set({...})
+
+    Using ticket_id as the document ID means saving the same ticket twice
+    overwrites the first — same behaviour as SQLite's INSERT OR REPLACE.
     """
-    conn = get_connection()
-    cursor = conn.cursor()
+    try:
+        # db.collection() selects the collection — like "FROM investigations"
+        # .document(ticket_id) selects the specific document by ID
+        #   — ticket_id is the primary key, e.g. "TKT-0001"
+        # .set() writes all fields — creates if not exists, overwrites if exists
+        doc_ref = db.collection(COLLECTION).document(ticket_id)
+        doc_ref.set({
+            "ticket_id":       ticket_id,
+            "service":         service,
+            "priority":        priority,
+            "category":        category,
+            "root_cause":      root_cause,
+            "resolution_type": resolution_type,
+            "summary":         summary,
+            # Store timestamp as ISO string — same format as the SQLite version
+            # so get_service_history() can slice [:10] to get the date unchanged
+            "created_at":      datetime.now(timezone.utc).isoformat(),
+        })
 
-    cursor.execute("""
-        INSERT INTO investigations
-            (ticket_id, service, priority, category,
-             root_cause, resolution_type, summary, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """,
-    (
-        ticket_id,
-        service,
-        priority,
-        category,
-        root_cause,
-        resolution_type,
-        summary,
-        datetime.now(timezone.utc).isoformat()
-        # Always store timestamps in UTC
-    ))
-    # The ? placeholders prevent SQL injection attacks
-    # Values are passed as a tuple as the second argument
+        print(f"  💾 Saved investigation for {service} to long-term memory")
 
-    conn.commit()
-    conn.close()
-
-    print(f"  💾 Saved investigation for {service} to long-term memory")
+    except Exception as e:
+        # Don't crash the agent if memory save fails — just log it
+        print(f"  ⚠️  Failed to save investigation for {ticket_id}: {e}")
 
 
 def get_service_history(service: str, limit: int = 5) -> str:
     """
     Retrieve the most recent past investigations for a service.
-    Returns formatted text the agent can read at the start of investigation.
+    Returns formatted text — identical format to the SQLite version.
 
-    Args:
-        service: service name to look up
-        limit:   how many past investigations to return
-    """
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        SELECT ticket_id, priority, category, root_cause, summary, created_at
-        FROM investigations
+    SQLite equivalent:
+        SELECT ... FROM investigations
         WHERE service = ?
         ORDER BY created_at DESC
         LIMIT ?
-    """, (service, limit))
-    # ORDER BY created_at DESC = most recent first
-    # LIMIT ? = only return this many rows
 
-    rows = cursor.fetchall()
-    conn.close()
+    Firestore equivalent:
+        db.collection("investigations")
+          .where("service", "==", service)
+          .order_by("created_at", direction=DESCENDING)
+          .limit(limit)
+          .stream()
+
+    Args:
+        service: service name to look up e.g. "auth-service"
+        limit:   how many past investigations to return
+    """
+    try:
+        # Chain query operations — each returns a new query object
+        # .where()    = filter (like SQL WHERE)
+        # .order_by() = sort   (like SQL ORDER BY)
+        # .limit()    = cap    (like SQL LIMIT)
+        # .stream()   = execute and return iterator of DocumentSnapshot objects
+        # NEW — uses filter= keyword argument
+        docs = (
+            db.collection(COLLECTION)
+            .where(filter=firestore.FieldFilter("service", "==", service))
+            .order_by("created_at", direction=firestore.Query.DESCENDING)
+            .limit(limit)
+            .stream()
+        )
+
+        # Convert DocumentSnapshot objects to plain dicts
+        # .to_dict() gives us the same field names we wrote in save_investigation()
+        rows = [doc.to_dict() for doc in docs]
+
+    except Exception as e:
+        print(f"  ⚠️  Failed to retrieve history for {service}: {e}")
+        return f"No previous investigations found for '{service}'."
 
     if not rows:
         return f"No previous investigations found for '{service}'."
 
+    # ── Format output — identical to SQLite version ───────────────────────────
+    # The agent reads this string directly, so the format must not change
     lines = [f"=== Past Investigations for '{service}' ===\n"]
 
     for row in rows:
-        # row["field"] works because we set conn.row_factory = sqlite3.Row
         lines.append(
             f"Ticket:     {row['ticket_id']}\n"
             f"Date:       {row['created_at'][:10]}\n"
-            # [:10] slices the ISO timestamp to just the date: "2025-01-15"
+            # [:10] slices "2025-01-15T10:30:00+00:00" → "2025-01-15"
+            # Works because we stored created_at as ISO string, same as before
             f"Priority:   {row['priority']}\n"
             f"Category:   {row['category']}\n"
             f"Root Cause: {row['root_cause']}\n"
@@ -164,25 +160,35 @@ def get_all_service_names() -> list[str]:
     """
     Return all service names that have investigation history.
     Useful for debugging — lets you see what's in memory.
+
+    SQLite equivalent:
+        SELECT DISTINCT service FROM investigations ORDER BY service
+
+    Firestore note: Firestore has no DISTINCT — we fetch all documents
+    and deduplicate in Python. Fine for a small dataset like this.
     """
-    conn = get_connection()
-    cursor = conn.cursor()
+    try:
+        docs = db.collection(COLLECTION).stream()
+        # Use a set to deduplicate service names — same as SQL DISTINCT
+        services = set()
+        for doc in docs:
+            data = doc.to_dict()
+            if data.get("service"):
+                services.add(data["service"])
 
-    cursor.execute("SELECT DISTINCT service FROM investigations ORDER BY service")
-    rows = cursor.fetchall()
-    conn.close()
+        # Return sorted list — same as SQLite's ORDER BY service
+        return sorted(list(services))
 
-    # List comprehension to extract service names from Row objects
-    return [row["service"] for row in rows]
+    except Exception as e:
+        print(f"  ⚠️  Failed to retrieve service names: {e}")
+        return []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SHORT-TERM MEMORY
+# Unchanged from Phase 5 — this is pure in-memory Python, no database involved.
 # Tracks key findings during the CURRENT investigation only.
-# Lives in memory (a Python dict) — not saved to disk.
 # Resets every time a new investigation starts.
-# Solves the context window problem — instead of keeping full tool outputs
-# in the messages list, we maintain a compact running summary here.
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ShortTermMemory:
@@ -196,8 +202,6 @@ class ShortTermMemory:
         self.ticket_id = ticket_id
         self.service   = service
         self.findings  = []
-        # findings is a list of strings, one per key observation
-        # Example: ["DB connections at 100/100", "Error rate 94%", "v2.3.1 deployed at 01:47"]
 
     def add_finding(self, finding: str):
         """
@@ -217,8 +221,6 @@ class ShortTermMemory:
 
         lines = [f"=== Investigation findings so far for {self.service} ==="]
         for i, finding in enumerate(self.findings, start=1):
-            # enumerate(list, start=1) gives (1, item), (2, item)...
-            # so i starts at 1 instead of 0
             lines.append(f"{i}. {finding}")
         return "\n".join(lines)
 
@@ -228,19 +230,18 @@ class ShortTermMemory:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# INITIALISE ON IMPORT
-# When any file imports from memory.py, the DB is created if it doesn't exist
+# NOTE: No initialise_db() call here — Firestore needs no schema setup.
+# Collections and documents are created automatically on first write.
 # ─────────────────────────────────────────────────────────────────────────────
-
-initialise_db()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TEST — run this file directly
+# TEST — run this file directly to verify Firestore connectivity
+# python agent/memory.py
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("Testing memory module...\n")
+    print("Testing Firestore memory module...\n")
 
     # Test saving investigations
     save_investigation(
@@ -273,12 +274,12 @@ if __name__ == "__main__":
         summary="Ran cache warm-up script. Hit rate recovered to 90%+ within 15 minutes."
     )
 
-    # Test retrieving history
+    # Test retrieving history — output must look identical to Phase 5
     print("\n" + get_service_history("auth-service"))
     print("\n" + get_service_history("payment-service"))
     print("\n" + get_service_history("search-service"))  # nothing here yet
 
-    # Test short-term memory
+    # Test short-term memory — completely unchanged
     print("\n--- Short-term memory test ---")
     stm = ShortTermMemory("TKT-TEST", "auth-service")
     stm.add_finding("DB connections at 100/100 — maxed out")
@@ -288,4 +289,3 @@ if __name__ == "__main__":
 
     # Show all services in memory
     print(f"\nServices in long-term memory: {get_all_service_names()}")
-    
